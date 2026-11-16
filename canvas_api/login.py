@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from urllib.parse import urlparse
@@ -36,8 +37,11 @@ class LoginStatus:
 
 
 MS_PASSKEY_TILE = '[role=button]:has-text("Face, fingerprint, PIN or security key")'
-DUO_SECURITY_KEY = 'button:has-text("Security key"), a:has-text("Security key"), [role=button]:has-text("Security key")'
-DUO_OTHER_OPTIONS = 'button:has-text("Other options"), a:has-text("Other options")'
+MS_TO_DUO = "text=/redirected to Duo/i"
+DUO_SECURITY_KEY = (':is(button, a, [role=button]):visible:has-text("hardware security key"), '
+                    ':is(button, a, [role=button]):visible:has-text("Use security key")')
+DUO_OTHER_OPTIONS = ':is(button, a):visible:has-text("Other options")'
+DUO_TRUST_BROWSER = '#trust-browser-button, button:visible:has-text("Yes, this is my device")'
 
 
 class MfaRequired(Exception):
@@ -232,11 +236,17 @@ class LoginManager:
                     await tile.first.click()
                     continue
 
+            if await _visible(page, MS_TO_DUO) and await _visible(page, "#idSIButton9"):
+                await self._step("Continuing to Duo")
+                await page.click("#idSIButton9")
+                await page.wait_for_load_state("domcontentloaded")
+                continue
+
             # --- Duo Universal Prompt (if the tenant federates MFA to Duo) ---------
             if "duosecurity.com" in host or "duo.com" in host:
-                if await _visible(page, "#trust-browser-button"):
-                    await self._step("Trusting this browser in Duo")
-                    await page.click("#trust-browser-button")
+                if await _visible(page, DUO_TRUST_BROWSER):
+                    await self._step("Telling Duo this is a trusted device")
+                    await page.locator(DUO_TRUST_BROWSER).first.click()
                     continue
                 if duo_passkey and duo_key_attempts < 3:
                     if await _visible(page, DUO_SECURITY_KEY):
@@ -253,11 +263,11 @@ class LoginManager:
                     continue  # Duo may already be asking the key; give it time
                 if self.status.automatic:
                     raise MfaRequired("Duo approval required; start a login with POST /session/login")
-                code_box = page.locator(".verification-code")
-                if await code_box.count() and await code_box.first.is_visible():
-                    number = (await code_box.first.inner_text()).strip()
-                    await self._update(state="awaiting_mfa", mfa_number=number,
-                                       message=f"Enter {number} in Duo Mobile to approve")
+                number = await _duo_verified_push_code(page)
+                if number:
+                    if self.status.mfa_number != number:
+                        await self._update(state="awaiting_mfa", mfa_number=number,
+                                           message=f"Enter {number} in Duo Mobile to approve")
                     continue
                 if await _visible(page, "input[name=passcode-input]"):
                     code = await self._otp_code(creds)
@@ -316,3 +326,15 @@ async def _usable(page: Page, selector: str) -> bool:
     except Exception:
         return False
     return bool(box and box["width"] >= 60 and box["height"] >= 20)
+
+
+async def _duo_verified_push_code(page: Page) -> str | None:
+    """The number Duo shows on 'Enter code in Duo Mobile' (verified push)."""
+    try:
+        text = await page.locator("body").inner_text(timeout=500)
+    except Exception:
+        return None
+    if "Enter code in Duo Mobile" not in text:
+        return None
+    match = re.search(r"(?m)^\s*(\d{3,6})\s*$", text)
+    return match.group(1) if match else None
