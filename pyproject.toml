@@ -12,6 +12,8 @@ dependencies = [
   "uvicorn",
   "playwright",
   "pyotp",
+  "beautifulsoup4",
+  "python-multipart",
 ]
 
 [project.scripts]

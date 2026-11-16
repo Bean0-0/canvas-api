@@ -15,8 +15,10 @@ from playwright.async_api import TimeoutError as PlaywrightTimeout
 from pydantic import BaseModel, Field
 
 from .browser import CanvasBrowser, strip_hijack_prefix
+from .canvas import Canvas, CanvasError, SessionExpired
 from .config import Credentials, Settings
 from .login import LoginManager
+from .routes import create_router
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +91,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     browser = CanvasBrowser(settings)
     login = LoginManager(settings, browser)
+    canvas = Canvas(browser)
     api_keys = ApiKeys(settings)
 
     async def keepalive() -> None:
@@ -134,6 +137,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(401, "Invalid or missing API key", headers={"WWW-Authenticate": "Bearer"})
 
     auth = [Depends(require_key)]
+
+    @app.exception_handler(SessionExpired)
+    async def _expired(_: Request, exc: SessionExpired):
+        if settings.load_credentials() or await browser.passkeys.has_any():
+            login.start(automatic=True)
+        return JSONResponse({"error": "canvas_session_expired",
+                             "detail": "The Canvas session is not logged in. POST /session/login to sign in.",
+                             "login": login.status.to_dict()}, status_code=401)
+
+    @app.exception_handler(CanvasError)
+    async def _canvas_error(_: Request, exc: CanvasError):
+        return JSONResponse({"error": "canvas_error", "status": exc.status, "detail": exc.detail},
+                            status_code=exc.status if 400 <= exc.status < 600 else 502)
 
     @app.exception_handler(PlaywrightTimeout)
     async def _timeout(_: Request, exc: PlaywrightTimeout):
@@ -328,6 +344,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             result = repr(result)
         return {"result": result}
 
+    @app.get("/browser/network", tags=["browser"], dependencies=auth)
+    async def browser_network(contains: str | None = None, limit: int = 200, include_headers: bool = False):
+        """API calls (XHR/fetch) the browser tab made, newest last. Use it to find internal endpoints:
+        POST /browser/goto a page, then read what it called."""
+        return {"requests": browser.network_log(contains, limit, include_headers)}
+
+    @app.delete("/browser/network", tags=["browser"], dependencies=auth)
+    async def browser_network_clear():
+        browser.clear_network_log()
+        return {"cleared": True}
+
+    app.include_router(create_router(canvas), dependencies=auth)
     return app
 
 

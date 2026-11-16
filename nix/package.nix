@@ -18,7 +18,7 @@ python3Packages.buildPythonApplication {
   };
 
   build-system = [ python3Packages.setuptools ];
-  dependencies = with python3Packages; [ fastapi uvicorn playwright pyotp ];
+  dependencies = with python3Packages; [ fastapi uvicorn playwright pyotp beautifulsoup4 python-multipart ];
   nativeCheckInputs = [ python3Packages.pytestCheckHook python3Packages.httpx ];
 
   makeWrapperArgs = [

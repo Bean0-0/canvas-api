@@ -95,7 +95,63 @@ or if you don't use a passkey. They go in the root-only `/etc/canvas-api/credent
 ssh -t <vps> sudo canvas-api-credentials
 ```
 
-## Canvas API
+## Endpoints for apps and agents
+
+These return compact JSON with plain-text bodies, absolute URLs, and the ids you need for
+the next call. They're built on the same internal endpoints the Canvas web app itself
+uses. Raw access is still available under `/api/...` (see below).
+
+| Endpoint | What it returns |
+| --- | --- |
+| `GET /todo?days=14` | `due`: upcoming planner items (assignments, quizzes, discussions) with submitted/graded/missing flags. `missing`: overdue work. `announcements`: recent posts |
+| `GET /courses` | Active courses with current scores (`?all=true` adds past ones) |
+| `GET /grades` | Current score and grade per course |
+| `GET /announcements?days=14&course_id=` | Announcements as text |
+| `GET /assignments?course_id=&bucket=` | Assignments and quizzes across courses with your status. `bucket` is one of `upcoming`, `past`, `overdue`, `unsubmitted`, `ungraded`, `undated`, `future` |
+| `GET /courses/{id}/assignments/{aid}` | Description text, rubric, allowed types and extensions, attempts, and your submission (files, comments, history) |
+| `GET /courses/{id}/modules` | Modules and items. Each item's `content` is this API's endpoint for reading it |
+| `GET /courses/{id}/pages/{slug}` | Page text and links (file links include a `download` path) |
+| `GET /courses/{id}/discussions/{tid}` | Discussion prompt and threaded replies |
+| `GET /files/{id}`, `GET /files/{id}/download` | File info and bytes |
+| `GET /quizzes?course_id=` | Quizzes (Classic and New) with score, attempts, and a `review` link |
+| `GET /courses/{id}/quizzes/{qid}/review?version=` | Your answers per question, with correctness and comments where the instructor shows them |
+| `POST /courses/{id}/assignments/{aid}/submit` | Submit text, a URL, or files. **Previews unless `confirm` is true** |
+| `POST /courses/{id}/assignments/{aid}/comment` | Comment on your submission (`confirm` required) |
+| `POST /courses/{id}/discussions/{tid}/reply` | Reply to a discussion (`confirm` required) |
+| `GET /browser/network?contains=` | Internal API calls the browser tab made. Use it to discover endpoints |
+
+### Submitting
+
+```sh
+# preview (nothing is submitted): checks type, extensions, attempts, lock, and lateness
+curl -H "$H" -F files=@report.pdf "$CANVAS_API/courses/123/assignments/456/submit"
+# submit for real
+curl -H "$H" -F files=@report.pdf -F confirm=true -F comment="Final version" \
+     "$CANVAS_API/courses/123/assignments/456/submit"
+# JSON works too: {"body": "<p>answer</p>", "confirm": true}, {"url": "https://..."},
+# or {"files": [{"name": "a.pdf", "content_base64": "..."}]}
+```
+
+A preview returns `warnings`, for example when the submission is late or replaces an
+earlier attempt. Problems such as a wrong file type, no attempts left, or a locked
+assignment return `422` and nothing is sent.
+
+### Quizzes
+
+The quiz review works for Classic Quizzes, even in courses that hide the Quizzes tab.
+Questions appear only when the instructor shows results; otherwise you get the score and
+`results_visible: false`. New Quizzes (`kind: new_quiz`) report scores. Their review runs
+in a separate Instructure app; to see what it calls, open the quiz with
+`/browser/goto` and read `/browser/network`.
+
+### Finding internal endpoints
+
+```sh
+curl -X DELETE -H "$H" $CANVAS_API/browser/network
+curl -X POST -H "$H" -H 'content-type: application/json' -d '{"url":"/courses/123/grades","wait_until":"networkidle"}' $CANVAS_API/browser/goto
+curl -H "$H" "$CANVAS_API/browser/network?contains=/api/"   # then call them via /api/...
+```
+
 
 `/api/...` forwards to `https://canvas.tamu.edu/api/...` with your session and the CSRF
 token. Requests use the same paths, query strings, and bodies as the Canvas docs.

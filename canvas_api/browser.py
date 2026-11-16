@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from collections import deque
 from dataclasses import dataclass
 from urllib.parse import unquote, urlencode
 
@@ -44,6 +46,7 @@ class CanvasBrowser:
         self._page: Page | None = None
         self._page_lock = asyncio.Lock()
         self.passkeys = PasskeyStore(settings.state_dir / "passkeys.json")
+        self._network: deque[dict] = deque(maxlen=1000)
 
     @property
     def context(self) -> BrowserContext:
@@ -91,7 +94,36 @@ class CanvasBrowser:
                 for extra in pages[1:]:
                     await extra.close()
                 await self.passkeys.attach(self.context, self._page)
+                self._page.on("response", self._record_response)
             return self._page
+
+    def _record_response(self, response) -> None:
+        request = response.request
+        if request.resource_type not in ("xhr", "fetch"):
+            return
+        headers = {k: v for k, v in request.headers.items() if k.lower() != "cookie"}
+        try:
+            post_data = (request.post_data or "")[:2000] or None
+        except Exception:  # binary bodies can't be decoded
+            post_data = "<binary>"
+        self._network.append({
+            "time": time.time(),
+            "method": request.method,
+            "url": request.url,
+            "status": response.status,
+            "content_type": response.headers.get("content-type"),
+            "post_data": post_data,
+            "request_headers": headers,
+        })
+
+    def network_log(self, contains: str | None, limit: int, include_headers: bool) -> list[dict]:
+        entries = [e for e in self._network if not contains or contains in e["url"]][-limit:]
+        if include_headers:
+            return entries
+        return [{k: v for k, v in e.items() if k != "request_headers"} for e in entries]
+
+    def clear_network_log(self) -> None:
+        self._network.clear()
 
     async def csrf_token(self) -> str | None:
         for cookie in await self.context.cookies(self.settings.base_url):
