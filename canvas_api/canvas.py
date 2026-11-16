@@ -80,7 +80,7 @@ class Canvas:
         return items
 
     async def web(self, path: str) -> str:
-        result = await self.browser.fetch("GET", path, headers={"Accept": "text/html"})
+        result = await self.browser.fetch("GET", path, headers={"Accept": "text/html"}, xhr=False)
         if result.status >= 400:
             raise CanvasError(result.status, "page not available")
         if not result.url.startswith(self.base_url) or "/login" in result.url:
@@ -556,6 +556,8 @@ def parse_quiz_history(html: str, base_url: str = "") -> dict:
     content = soup.select_one("#content") or soup
     page_text = _text(content)
     title = _text(soup.title).split(": ", 1)[-1] if soup.title else None
+    if not title and (heading := content.select_one("#quiz_title, .quiz-header h1, h1, h2")):
+        title = _text(heading)
 
     score = possible = None
     if m := re.search(r"Score for this (?:attempt|quiz):\s*([\d.]+)\s*out of\s*([\d.]+)", page_text):

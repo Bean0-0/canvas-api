@@ -141,3 +141,8 @@ def test_submit_rejects_when_no_attempts_left():
     fake = FakeCanvas(allowed_attempts=1, submission={"attempt": 1, "submitted_at": "2026-01-01T00:00:00Z"})
     r = client_for(fake).post("/courses/1/assignments/5/submit", json={"body": "x", "confirm": True})
     assert r.status_code == 422 and "No attempts left" in str(r.json())
+
+
+def test_quiz_title_falls_back_to_heading():
+    html = '<html><body><div id="content"><h1 id="quiz_title">Week 9 Quiz</h1>Score for this attempt: 1 out of 2</div></body></html>'
+    assert parse_quiz_history(html)["title"] == "Week 9 Quiz"

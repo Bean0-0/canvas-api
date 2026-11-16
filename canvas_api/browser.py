@@ -141,11 +141,15 @@ class CanvasBrowser:
         headers: dict[str, str] | None = None,
         follow_redirects: bool = True,
         timeout_ms: float = 60_000,
+        xhr: bool = True,
     ) -> FetchResult:
         """Make a request with the browser's cookies, adding Canvas's CSRF header."""
         if url.startswith("/"):
             url = self.settings.base_url + url
-        send_headers = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
+        # XHR marks API calls so Canvas skips its JSON-hijacking prefix; full pages are fetched without it.
+        send_headers = {"Accept": "application/json"}
+        if xhr:
+            send_headers["X-Requested-With"] = "XMLHttpRequest"
         send_headers.update(headers or {})
         if method.upper() not in ("GET", "HEAD", "OPTIONS"):
             token = await self.csrf_token()

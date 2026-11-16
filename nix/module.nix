@@ -12,7 +12,7 @@ let
   # per credentialId the highest signCount wins and a known rpId is never forgotten.
   backupPasskeys = pkgs.writeShellApplication {
     name = "canvas-api-backup-passkeys";
-    runtimeInputs = [ pkgs.coreutils pkgs.jq ];
+    runtimeInputs = [ pkgs.coreutils pkgs.diffutils pkgs.jq ];
     text = ''
       install -d -o root -g root -m 0700 ${backupDir}
       sources=()
@@ -41,7 +41,7 @@ let
   # Root half of startup: create an API key once, hand credentials to the service user.
   prepare = pkgs.writeShellApplication {
     name = "canvas-api-prepare";
-    runtimeInputs = [ pkgs.coreutils pkgs.openssl ];
+    runtimeInputs = [ pkgs.coreutils pkgs.diffutils pkgs.openssl ];
     text = ''
       if [[ ! -s ${stateDir}/api-key ]]; then
         (umask 027; openssl rand -hex 32 > ${stateDir}/api-key.tmp)
