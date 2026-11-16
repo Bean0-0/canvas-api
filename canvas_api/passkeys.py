@@ -82,6 +82,10 @@ class PasskeyStore:
         if self._session is None:
             return len(self._saved)
         current = await self.credentials()
+        # Never drop a stored key: keep any saved credential the authenticator doesn't report
+        # (e.g. one that could not be loaded). The private key cannot be recovered once lost.
+        reported = {c.get("credentialId") for c in current}
+        current += [c for c in self.load() if c.get("credentialId") not in reported]
         if current == self._saved:
             return len(current)
         tmp = self.path.with_suffix(".tmp")

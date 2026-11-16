@@ -151,3 +151,25 @@ def test_passkey_survives_restart(tmp_path):
             assert [p["rpId"] for p in stored] == ["localhost"]
     finally:
         server.shutdown()
+
+
+def test_unloadable_passkey_is_never_dropped(tmp_path):
+    """A stored key the browser cannot load must survive a save untouched."""
+    import json
+
+    settings = make_settings(tmp_path)
+    broken = {"credentialId": "abc", "privateKey": "secret", "rpId": None, "signCount": 4}
+    (tmp_path / "passkeys.json").write_text(json.dumps({"credentials": [broken]}))
+
+    async def run():
+        browser = CanvasBrowser(settings)
+        await browser.start()
+        try:
+            await browser.control_page()
+            await browser.passkeys.save()
+        finally:
+            await browser.stop()
+
+    asyncio.run(run())
+    kept = json.loads((tmp_path / "passkeys.json").read_text())["credentials"]
+    assert {"credentialId": "abc", "privateKey": "secret", "rpId": None, "signCount": 4} in kept
