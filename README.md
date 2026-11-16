@@ -113,6 +113,10 @@ uses. Raw access is still available under `/api/...` (see below).
 | `GET /courses/{id}/pages/{slug}` | Page text and links (file links include a `download` path) |
 | `GET /courses/{id}/discussions/{tid}` | Discussion prompt and threaded replies |
 | `GET /files/{id}`, `GET /files/{id}/download` | File info and bytes |
+| `GET /courses/{id}/modules/{mid}/files` | Downloads inside one module: its file items plus files attached in its pages, assignments, discussions and quizzes |
+| `GET /courses/{id}/modules/{mid}/files/zip` | Those files as a ZIP, one folder per page or assignment, plus `manifest.json` |
+| `GET /courses/{id}/files`, `.../files/zip` | The same for a whole course, including the Files tab when the course enables it |
+| `GET /courses/{id}/grades` | Each assignment's score, percent, status, and class mean/median/quartiles (when released), plus group weights and totals |
 | `GET /quizzes?course_id=` | Quizzes (Classic and New) with score, attempts, and a `review` link |
 | `GET /courses/{id}/quizzes/{qid}/review?version=` | Your answers per question, with correctness and comments where the instructor shows them |
 | `POST /courses/{id}/assignments/{aid}/submit` | Submit text, a URL, or files. **Previews unless `confirm` is true** |
@@ -135,6 +139,19 @@ curl -H "$H" -F files=@report.pdf -F confirm=true -F comment="Final version" \
 A preview returns `warnings`, for example when the submission is late or replaces an
 earlier attempt. Problems such as a wrong file type, no attempts left, or a locked
 assignment return `422` and nothing is sent.
+
+### Downloads
+
+File endpoints skip images by default, because most are pictures embedded in pages; add
+`include_images=true` to keep them. You can narrow the list with `types=pdf,pptx` or
+`match=lecture`. Each module in `GET /courses/{id}/modules` has a `files` link and a
+`file_items` count.
+
+```sh
+curl -H "$H" "$CANVAS_API/courses/123/modules/456/files"                      # list
+curl -H "$H" -o week1.zip "$CANVAS_API/courses/123/modules/456/files/zip"      # everything in the module
+curl -H "$H" -o slides.zip "$CANVAS_API/courses/123/files/zip?types=pdf,pptx"  # whole course, filtered
+```
 
 ### Quizzes
 

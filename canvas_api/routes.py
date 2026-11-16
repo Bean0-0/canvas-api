@@ -3,11 +3,16 @@
 import asyncio
 import base64
 import binascii
+import json
 import mimetypes
+import re
+import tempfile
+import zipfile
 from datetime import datetime, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from .canvas import Canvas, CanvasError
@@ -57,9 +62,16 @@ def create_router(canvas: Canvas) -> APIRouter:
     async def courses(all: bool = Query(False, description="Include past/concluded courses")):
         return await canvas.courses(include_all=all)
 
-    @router.get("/grades", tags=["overview"])
+    @router.get("/grades", tags=["grades"])
     async def grades():
+        """Current score and letter grade in each active course."""
         return await canvas.grades()
+
+    @router.get("/courses/{course_id}/grades", tags=["grades"])
+    async def course_grades(course_id: int):
+        """Every assignment's score, percent and class stats (mean/median/quartiles when released),
+        plus assignment-group weights and totals."""
+        return await canvas.course_grades(course_id)
 
     @router.get("/announcements", tags=["overview"])
     async def announcements(days: int = Query(14, ge=1, le=365), course_id: int | None = None):
@@ -113,15 +125,57 @@ def create_router(canvas: Canvas) -> APIRouter:
     async def file_info(file_id: int):
         return await canvas.file_info(file_id)
 
-    @router.get("/files/{file_id}/download", tags=["content"], response_class=Response)
+    @router.get("/files/{file_id}/download", tags=["files"], response_class=Response)
     async def file_download(file_id: int):
-        info = await canvas.get(f"/api/v1/files/{file_id}")
-        result = await canvas.browser.fetch("GET", info["url"], headers={"Accept": "*/*"})
-        if result.status >= 400:
-            raise HTTPException(result.status, "Download failed")
+        info, data = await canvas.download(file_id)
         name = (info.get("display_name") or "file").replace('"', "")
-        return Response(result.body, media_type=info.get("content-type") or "application/octet-stream",
+        return Response(data, media_type=info.get("content-type") or "application/octet-stream",
                         headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+    @router.get("/courses/{course_id}/files", tags=["files"])
+    async def course_files(
+        course_id: int,
+        include_images: bool = Query(False, description="Include images (most are embedded in pages)"),
+        scan: bool = Query(True, description="Also find files linked from pages and assignment descriptions"),
+        types: str | None = Query(None, description="Comma-separated extensions, e.g. pdf,pptx,xlsx"),
+        match: str | None = Query(None, description="Only names containing this text"),
+    ):
+        """Every downloadable file in a course, from the Files tab (if enabled), modules, and links."""
+        return await canvas.course_files(course_id, include_images, scan, _split(types), match)
+
+    @router.get("/courses/{course_id}/files/zip", tags=["files"], response_class=StreamingResponse)
+    async def course_files_zip(
+        course_id: int,
+        include_images: bool = False,
+        scan: bool = True,
+        types: str | None = None,
+        match: str | None = None,
+        max_mb: int = Query(1000, ge=1, le=5000, description="Refuse if the total is larger than this"),
+    ):
+        """All of a course's files as one ZIP (folders from the Files tab or module names) + manifest.json."""
+        listing = await canvas.course_files(course_id, include_images, scan, _split(types), match)
+        return await _zip_response(canvas, listing, f"course-{course_id}", max_mb)
+
+    @router.get("/courses/{course_id}/modules/{module_id}/files", tags=["files"])
+    async def module_files(
+        course_id: int,
+        module_id: int,
+        include_images: bool = Query(False, description="Include images (most are embedded in pages)"),
+        types: str | None = Query(None, description="Comma-separated extensions, e.g. pdf,pptx,xlsx"),
+        match: str | None = Query(None, description="Only names containing this text"),
+    ):
+        """Downloads inside one module: its file items, plus files attached in its pages,
+        assignments, discussions and quizzes."""
+        return await canvas.module_files(course_id, module_id, include_images, _split(types), match)
+
+    @router.get("/courses/{course_id}/modules/{module_id}/files/zip", tags=["files"],
+                response_class=StreamingResponse)
+    async def module_files_zip(course_id: int, module_id: int, include_images: bool = False,
+                               types: str | None = None, match: str | None = None,
+                               max_mb: int = Query(1000, ge=1, le=5000)):
+        """One module's downloads as a ZIP (folders per page/assignment) + manifest.json."""
+        listing = await canvas.module_files(course_id, module_id, include_images, _split(types), match)
+        return await _zip_response(canvas, listing, listing.get("module") or f"module-{module_id}", max_mb)
 
     # ---------------------------------------------------------- assignments
 
@@ -263,6 +317,52 @@ async def _read_submit_request(request: Request) -> tuple[SubmitRequest, list[tu
             raise HTTPException(422, f"{f.name}: content_base64 is not valid base64") from None
         files.append((f.name, data, f.content_type or _guess_type(f.name)))
     return req, files
+
+
+async def _zip_response(canvas: Canvas, listing: dict, name: str, max_mb: int) -> StreamingResponse:
+    if listing["total_bytes"] > max_mb * 1024 * 1024:
+        raise HTTPException(413, f"{listing['total_bytes'] // 1024 // 1024} MB is over max_mb={max_mb}; "
+                                 "narrow it with types= or match=, or raise max_mb")
+    spool = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024)
+    failures, used = [], set()
+    sem = asyncio.Semaphore(4)
+
+    async def fetch(f: dict):
+        async with sem:
+            try:
+                return f, (await canvas.download(f["id"]))[1]
+            except Exception as exc:  # keep going; report in the manifest
+                return f, exc
+
+    with zipfile.ZipFile(spool, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for f, data in await asyncio.gather(*(fetch(f) for f in listing["files"])):
+            if isinstance(data, BaseException):
+                failures.append({"id": f["id"], "name": f["name"], "error": str(data)[:200]})
+                continue
+            arcname = "/".join(p for p in (f["path"], f["name"] or str(f["id"])) if p)
+            if arcname in used:
+                stem, dot, ext = arcname.rpartition(".")
+                arcname = f"{stem} ({f['id']}).{ext}" if dot else f"{arcname} ({f['id']})"
+            used.add(arcname)
+            f["zip_path"] = arcname
+            zf.writestr(arcname, data)
+        zf.writestr("manifest.json", json.dumps({**listing, "failures": failures}, indent=1))
+    spool.seek(0)
+    filename = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")[:80] or "files"
+
+    def chunks():
+        with spool:
+            while block := spool.read(1024 * 1024):
+                yield block
+
+    return StreamingResponse(chunks(), media_type="application/zip",
+                             headers={"Content-Disposition": f'attachment; filename="{filename}.zip"',
+                                      "X-Files": str(len(listing["files"]) - len(failures)),
+                                      "X-Failures": str(len(failures))})
+
+
+def _split(value: str | None) -> list[str] | None:
+    return [v.strip() for v in value.split(",") if v.strip()] if value else None
 
 
 def _guess_type(name: str | None) -> str:

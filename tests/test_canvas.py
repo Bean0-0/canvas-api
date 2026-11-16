@@ -146,3 +146,75 @@ def test_submit_rejects_when_no_attempts_left():
 def test_quiz_title_falls_back_to_heading():
     html = '<html><body><div id="content"><h1 id="quiz_title">Week 9 Quiz</h1>Score for this attempt: 1 out of 2</div></body></html>'
     assert parse_quiz_history(html)["title"] == "Week 9 Quiz"
+
+
+from canvas_api.canvas import Canvas, _filter_files  # noqa: E402
+
+
+class FakeFilesCanvas(Canvas):
+    """Canvas with canned API responses for one module."""
+
+    FILES = {
+        1: {"id": 1, "display_name": "Lecture 1.pdf", "content-type": "application/pdf", "size": 10},
+        2: {"id": 2, "display_name": "Data.xlsx", "content-type": "application/vnd.ms-excel", "size": 20},
+        3: {"id": 3, "display_name": "diagram.png", "content-type": "image/png", "size": 30},
+    }
+
+    def __init__(self):
+        self.base_url = BASE
+
+    async def get(self, path, params=None):
+        if path == "/api/v1/courses/9/modules/5":
+            return {"id": 5, "name": "Week 1: Intro"}
+        if path == "/api/v1/courses/9/pages/lab-handout":
+            return {"body": '<a href="/courses/9/files/2">data</a> <img src="/courses/9/files/3/preview">'
+                            ' <a href="/courses/9/files/404">gone</a>'}
+        if path.startswith("/api/v1/files/"):
+            fid = int(path.rsplit("/", 1)[1])
+            if fid not in self.FILES:
+                raise CanvasError(404, "not found")
+            return self.FILES[fid]
+        raise AssertionError(path)
+
+    async def get_all(self, path, params=None, max_pages=50):
+        assert path == "/api/v1/courses/9/modules/5/items"
+        return [{"type": "File", "title": "Lecture 1", "content_id": 1},
+                {"type": "Page", "title": "Lab Handout", "page_url": "lab-handout"},
+                {"type": "ExternalUrl", "title": "Video", "external_url": "https://x.y"}]
+
+    async def download(self, file_id):
+        return self.FILES[file_id], f"bytes-{file_id}".encode()
+
+
+def test_module_files_collects_items_and_attachments():
+    import asyncio
+
+    r = asyncio.run(FakeFilesCanvas().module_files(9, 5))
+    assert r["module"] == "Week 1: Intro"
+    assert [(f["path"], f["name"], f["sources"]) for f in r["files"]] == [
+        ("", "Lecture 1.pdf", ["module"]), ("Lab Handout", "Data.xlsx", ["page"])]
+    assert any("404" in e for e in r["errors"])  # unreachable link reported, not fatal
+    with_images = asyncio.run(FakeFilesCanvas().module_files(9, 5, include_images=True))
+    assert "diagram.png" in [f["name"] for f in with_images["files"]]
+    only_pdf = asyncio.run(FakeFilesCanvas().module_files(9, 5, types=["pdf"]))
+    assert [f["name"] for f in only_pdf["files"]] == ["Lecture 1.pdf"]
+
+
+def test_module_zip():
+    import io
+    import json
+    import zipfile
+
+    r = client_for(FakeFilesCanvas()).get("/courses/9/modules/5/files/zip")
+    assert r.status_code == 200 and r.headers["content-type"] == "application/zip"
+    assert 'filename="Week_1_Intro.zip"' in r.headers["content-disposition"]
+    zf = zipfile.ZipFile(io.BytesIO(r.content))
+    assert sorted(zf.namelist()) == ["Lab Handout/Data.xlsx", "Lecture 1.pdf", "manifest.json"]
+    assert zf.read("Lab Handout/Data.xlsx") == b"bytes-2"
+    assert json.loads(zf.read("manifest.json"))["count"] == 2
+
+
+def test_filter_files_by_match():
+    files = [{"name": "HW1.pdf", "content_type": "application/pdf", "path": ""},
+             {"name": "Notes.pdf", "content_type": "application/pdf", "path": ""}]
+    assert [f["name"] for f in _filter_files(files, False, None, "hw")] == ["HW1.pdf"]

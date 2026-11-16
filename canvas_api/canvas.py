@@ -139,6 +139,7 @@ class Canvas:
             "status": _submission_status(sub),
             "score": sub.get("score"),
             "grade": sub.get("grade"),
+            "percent": _percent(sub.get("score"), a.get("points_possible")),
             "submitted_at": sub.get("submitted_at"),
             "late": sub.get("late"),
             "missing": sub.get("missing"),
@@ -172,6 +173,7 @@ class Canvas:
             ],
             "score_statistics": a.get("score_statistics"),
             "submission": self.submission_detail(sub),
+            "rubric_scores": _rubric_scores(a.get("rubric") or [], sub.get("rubric_assessment") or {}),
         })
         return out
 
@@ -277,6 +279,8 @@ class Canvas:
                 "name": m.get("name"),
                 "state": m.get("state"),
                 "unlock_at": m.get("unlock_at"),
+                "file_items": sum(1 for i in items if i.get("type") == "File"),
+                "files": f"/courses/{course_id}/modules/{m['id']}/files",
                 "items": [self.module_item(course_id, i) for i in items],
             })
         return out
@@ -399,6 +403,169 @@ class Canvas:
             for e in enrollments if e.get("course_id") in names
         ]
 
+    async def course_grades(self, course_id: int) -> dict:
+        """Every assignment's score with class stats, grouped and weighted like the gradebook."""
+        course, groups, enrollments = await asyncio.gather(
+            self.get(f"/api/v1/courses/{course_id}"),
+            self.get_all(f"/api/v1/courses/{course_id}/assignment_groups",
+                         [("include[]", "assignments"), ("include[]", "submission"),
+                          ("include[]", "score_statistics")]),
+            self.get_all("/api/v1/users/self/enrollments", [("state[]", "active"), ("type[]", "StudentEnrollment")]),
+        )
+        weighted = bool(course.get("apply_assignment_group_weights"))
+        out_groups, assignments = [], []
+        for g in groups:
+            earned = possible = 0.0
+            graded = 0
+            for a in g.get("assignments") or []:
+                sub = a.get("submission") or {}
+                stats = a.get("score_statistics")
+                item = {
+                    **self.assignment_summary(a),
+                    "group": g.get("name"),
+                    "excused": sub.get("excused"),
+                    "posted": bool(sub.get("posted_at")),
+                    "omit_from_final_grade": a.get("omit_from_final_grade"),
+                    "class_stats": stats,
+                    "vs_mean": (round(sub["score"] - stats["mean"], 2)
+                                if stats and sub.get("score") is not None and stats.get("mean") is not None else None),
+                }
+                assignments.append(item)
+                if (sub.get("score") is not None and not sub.get("excused") and a.get("points_possible")
+                        and not a.get("omit_from_final_grade")):
+                    earned += sub["score"]
+                    possible += a["points_possible"]
+                    graded += 1
+            out_groups.append({
+                "id": g.get("id"), "name": g.get("name"),
+                "weight": g.get("group_weight") if weighted else None,
+                "score": round(earned, 2), "points_possible": round(possible, 2),
+                "percent": _percent(earned, possible), "graded_count": graded,
+                "drop_rules": g.get("rules") or None,
+            })
+        grades = next((e.get("grades") or {} for e in enrollments if e.get("course_id") == course_id), {})
+        return {
+            "course_id": course_id,
+            "course": course.get("name"),
+            "current_score": grades.get("current_score"),
+            "current_grade": grades.get("current_grade"),
+            "final_score": grades.get("final_score"),
+            "weighted_groups": weighted,
+            "groups": out_groups,
+            "assignments": sorted(assignments, key=lambda a: (a["due_at"] is None, a["due_at"] or "")),
+            "note": "Group percents are simple sums of graded work and ignore drop rules; "
+                    "current_score is Canvas's own calculation.",
+        }
+
+    async def course_files(self, course_id: int, include_images: bool = False, scan_content: bool = True,
+                           types: list[str] | None = None, match: str | None = None) -> dict:
+        """Every file you can reach in a course: Files tab, module items, and links in pages/assignments."""
+        found: dict[int, dict] = {}
+        wanted: dict[int, tuple[str, str]] = {}
+        sources_used, errors = [], []
+        try:
+            files, folders = await asyncio.gather(
+                self.get_all(f"/api/v1/courses/{course_id}/files"),
+                self.get_all(f"/api/v1/courses/{course_id}/folders"))
+            names = {f["id"]: re.sub(r"^course files/?", "", f.get("full_name") or "") for f in folders}
+            for f in files:
+                _add_file(found, f, names.get(f.get("folder_id"), ""), "files")
+            sources_used.append("files")
+        except CanvasError as exc:
+            errors.append(f"Files tab unavailable ({exc.status}); using modules and links")
+
+        for m in await self.get_all(f"/api/v1/courses/{course_id}/modules", [("include[]", "items")]):
+            items = m.get("items")
+            if items is None:
+                items = await self.get_all(f"/api/v1/courses/{course_id}/modules/{m['id']}/items")
+            for i in items:
+                if i.get("type") == "File" and i.get("content_id"):
+                    wanted.setdefault(i["content_id"], (_safe_path(m.get("name") or "module"), "module"))
+        sources_used.append("modules")
+
+        if scan_content:
+            pages, assignments = await asyncio.gather(
+                self.get_all(f"/api/v1/courses/{course_id}/pages", [("include[]", "body")]),
+                self.get_all(f"/api/v1/courses/{course_id}/assignments"),
+                return_exceptions=True)
+            for kind, items, body_key, title_key in (("page", pages, "body", "title"),
+                                                     ("assignment", assignments, "description", "name")):
+                if isinstance(items, BaseException):
+                    continue
+                for item in items:
+                    for fid in _file_ids(item.get(body_key)):
+                        wanted.setdefault(fid, (_safe_path(f"{kind}s/{item.get(title_key) or ''}"), kind))
+            sources_used += ["pages", "assignments"]
+
+        await self._resolve_files(found, wanted, errors)
+        out = _filter_files(found.values(), include_images, types, match)
+        return {"course_id": course_id, "count": len(out), "total_bytes": sum(f["size"] or 0 for f in out),
+                "sources": sources_used, "files": out, "errors": errors}
+
+    async def module_files(self, course_id: int, module_id: int, include_images: bool = False,
+                           types: list[str] | None = None, match: str | None = None) -> dict:
+        """Downloads inside one module: its file items plus files attached in its pages,
+        assignments, discussions and quizzes. Paths are `<item title>/<file>`."""
+        module, items = await asyncio.gather(
+            self.get(f"/api/v1/courses/{course_id}/modules/{module_id}"),
+            self.get_all(f"/api/v1/courses/{course_id}/modules/{module_id}/items"))
+        found: dict[int, dict] = {}
+        wanted: dict[int, tuple[str, str]] = {}
+        errors: list[str] = []
+        for i in items:
+            if i.get("type") == "File" and i.get("content_id"):
+                wanted.setdefault(i["content_id"], ("", "module"))
+
+        async def body_of(i: dict) -> tuple[dict, str | None]:
+            kind, cid = i.get("type"), i.get("content_id")
+            try:
+                if kind == "Page" and i.get("page_url"):
+                    return i, (await self.get(f"/api/v1/courses/{course_id}/pages/{i['page_url']}")).get("body")
+                if kind == "Assignment":
+                    return i, (await self.get(f"/api/v1/courses/{course_id}/assignments/{cid}")).get("description")
+                if kind == "Discussion":
+                    return i, (await self.get(f"/api/v1/courses/{course_id}/discussion_topics/{cid}")).get("message")
+                if kind == "Quiz":
+                    return i, (await self.get(f"/api/v1/courses/{course_id}/quizzes/{cid}")).get("description")
+            except CanvasError as exc:
+                errors.append(f"{kind} '{i.get('title')}' not readable ({exc.status})")
+            return i, None
+
+        for i, body in await asyncio.gather(*(body_of(i) for i in items)):
+            for fid in _file_ids(body):
+                wanted.setdefault(fid, (_safe_path(i.get("title") or ""), i.get("type", "").lower()))
+
+        await self._resolve_files(found, wanted, errors)
+        out = _filter_files(found.values(), include_images, types, match)
+        return {"course_id": course_id, "module_id": module_id, "module": module.get("name"),
+                "count": len(out), "total_bytes": sum(f["size"] or 0 for f in out),
+                "files": out, "errors": errors}
+
+    async def _resolve_files(self, found: dict[int, dict], wanted: dict[int, tuple[str, str]],
+                             errors: list[str]) -> None:
+        sem = asyncio.Semaphore(8)
+
+        async def lookup(fid: int, path: str, source: str) -> None:
+            if fid in found:
+                if source not in found[fid]["sources"]:
+                    found[fid]["sources"].append(source)
+                return
+            async with sem:
+                try:
+                    _add_file(found, await self.get(f"/api/v1/files/{fid}"), path, source)
+                except CanvasError:
+                    errors.append(f"file {fid} ({source}) not accessible")
+
+        await asyncio.gather(*(lookup(fid, path, src) for fid, (path, src) in wanted.items()))
+
+    async def download(self, file_id: int) -> tuple[dict, bytes]:
+        info = await self.get(f"/api/v1/files/{file_id}")
+        result = await self.browser.fetch("GET", info["url"], headers={"Accept": "*/*"}, xhr=False,
+                                          timeout_ms=300_000)
+        if result.status >= 400:
+            raise CanvasError(result.status, f"download of file {file_id} failed")
+        return info, result.body
+
     async def announcements(self, days: int, course_id: int | None = None) -> list[dict]:
         from datetime import datetime, timedelta, timezone
 
@@ -491,6 +658,62 @@ def _file(f: dict) -> dict:
             "content_type": f.get("content-type") or f.get("content_type"), "size": f.get("size"),
             "updated_at": f.get("updated_at"),
             "download": f"/files/{f['id']}/download" if f.get("id") else None}
+
+
+def _add_file(found: dict[int, dict], info: dict, path: str, source: str) -> None:
+    if not info.get("id"):
+        return
+    entry = found.setdefault(info["id"], {**_file(info), "path": path, "sources": []})
+    if source not in entry["sources"]:
+        entry["sources"].append(source)
+
+
+def _filter_files(files, include_images: bool, types: list[str] | None, match: str | None) -> list[dict]:
+    type_set = {t.lower().lstrip(".") for t in types or []}
+    out = []
+    for f in files:
+        name = f["name"] or ""
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        if not include_images and (f.get("content_type") or "").startswith("image/"):
+            continue
+        if type_set and ext not in type_set:
+            continue
+        if match and match.lower() not in name.lower():
+            continue
+        out.append(f)
+    return sorted(out, key=lambda f: (f["path"], name_key(f)))
+
+
+def name_key(f: dict) -> str:
+    return (f["name"] or "").lower()
+
+
+def _percent(score, possible) -> float | None:
+    try:
+        return round(100 * float(score) / float(possible), 2) if score is not None and possible else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _rubric_scores(rubric: list[dict], assessment: dict) -> list[dict]:
+    out = []
+    for criterion in rubric:
+        result = assessment.get(criterion.get("id")) or {}
+        rating = next((r.get("description") for r in criterion.get("ratings", [])
+                       if r.get("id") and r.get("id") == result.get("rating_id")), None)
+        out.append({"criterion": criterion.get("description"), "points": result.get("points"),
+                    "points_possible": criterion.get("points"), "rating": rating,
+                    "comments": result.get("comments") or None})
+    return out
+
+
+def _file_ids(html: str | None) -> list[int]:
+    return [int(x) for x in dict.fromkeys(re.findall(r"/files/(\d+)", html or ""))]
+
+
+def _safe_path(text: str) -> str:
+    parts = [re.sub(r'[\x00-\x1f<>:"\\|?*]+', "_", p).strip(" .") for p in text.split("/")]
+    return "/".join(p[:80] for p in parts if p)
 
 
 def _submission_status(s: dict) -> str:
