@@ -288,6 +288,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/browser/goto", tags=["browser"], dependencies=auth)
     async def browser_goto(body: GotoRequest):
         page = await browser.control_page()
+        await browser.passkeys.sync()  # the page may use the (possibly shared) key
         url = settings.base_url + body.url if body.url.startswith("/") else body.url
         response = await page.goto(url, wait_until=body.wait_until)
         return {**await page_state(), "status": response.status if response else None}
@@ -310,6 +311,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/browser/click", tags=["browser"], dependencies=auth)
     async def browser_click(body: SelectorRequest):
         page = await browser.control_page()
+        await browser.passkeys.sync()
         await page.locator(body.selector).first.click(timeout=body.timeout_ms)
         return await page_state()
 

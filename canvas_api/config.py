@@ -31,10 +31,16 @@ class Settings:
     port: int
     keepalive_seconds: int
     login_timeout_seconds: int
+    passkey_file: Path | None = None  # default: <state_dir>/passkeys.json
+    passkey_shared: bool = False  # group-writable (0660), for a key shared with another service
 
     @property
     def profile_dir(self) -> Path:
         return self.state_dir / "profile"
+
+    @property
+    def passkey_path(self) -> Path:
+        return self.passkey_file or self.state_dir / "passkeys.json"
 
     @property
     def base_host(self) -> str:
@@ -53,6 +59,8 @@ class Settings:
             port=int(os.environ.get("CANVAS_API_PORT", "8787")),
             keepalive_seconds=int(os.environ.get("CANVAS_API_KEEPALIVE_SECONDS", "600")),
             login_timeout_seconds=int(os.environ.get("CANVAS_API_LOGIN_TIMEOUT_SECONDS", "300")),
+            passkey_file=Path(os.environ["CANVAS_API_PASSKEY_FILE"]) if os.environ.get("CANVAS_API_PASSKEY_FILE") else None,
+            passkey_shared=os.environ.get("CANVAS_API_PASSKEY_SHARED", "").lower() in ("1", "true", "yes"),
         )
 
     def load_credentials(self) -> Credentials | None:

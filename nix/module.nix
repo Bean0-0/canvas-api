@@ -3,7 +3,12 @@ let
   cfg = config.services.canvas-api;
   stateDir = "/var/lib/canvas-api";
   runtimeCreds = "/run/canvas-api/credentials.env";
-  passkeyFile = "${stateDir}/passkeys.json";
+  legacyPasskeyFile = "${stateDir}/passkeys.json";
+  passkeyFile = cfg.passkeyFile;
+  passkeyDir = builtins.dirOf passkeyFile;
+  shared = cfg.sharedAuthGroup != null;
+  keyGroup = if shared then cfg.sharedAuthGroup else "canvas-api";
+  keyMode = if shared then "0660" else "0600";
   backupDir = "/var/backups/canvas-api";
   passkeyBackup = "${backupDir}/passkeys.json";
 
@@ -16,7 +21,7 @@ let
     text = ''
       install -d -o root -g root -m 0700 ${backupDir}
       sources=()
-      for f in ${passkeyBackup} ${passkeyFile}; do
+      for f in ${passkeyBackup} ${passkeyFile} ${legacyPasskeyFile}; do
         if [[ -s "$f" ]] && jq -e '.credentials | type == "array"' "$f" >/dev/null 2>&1; then
           sources+=("$f")
         else
@@ -53,7 +58,7 @@ let
       # Back up, then restore any key missing from (or older in) the service's own file.
       ${backupPasskeys}/bin/canvas-api-backup-passkeys
       if [[ -s ${passkeyBackup} ]] && ! cmp -s ${passkeyBackup} ${passkeyFile}; then
-        install -o canvas-api -g canvas-api -m 0600 ${passkeyBackup} ${passkeyFile}
+        install -o canvas-api -g ${keyGroup} -m ${keyMode} ${passkeyBackup} ${passkeyFile}
         echo "restored passkeys from ${passkeyBackup}"
       fi
       if [[ -f ${lib.escapeShellArg cfg.credentialsFile} ]]; then
@@ -130,10 +135,31 @@ in
       description = "Users added to the canvas-api group, allowing them to read the API key.";
     };
     keepaliveSeconds = lib.mkOption { type = lib.types.ints.positive; default = 600; };
+    passkeyFile = lib.mkOption {
+      type = lib.types.str;
+      default = legacyPasskeyFile;
+      example = "/var/lib/tamu-auth/passkeys.json";
+      description = "Where the virtual security key's credentials live.";
+    };
+    sharedAuthGroup = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "tamu-auth";
+      description = ''
+        Share the security key with other services in this group (e.g. encando-api). The
+        directory of passkeyFile becomes root:<group> 2770 and the file 0660. Every user of the
+        file must raise the signature counter from the clock before each use (see passkeys.py).
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
-    users.groups.canvas-api = { };
+    assertions = [{
+      assertion = shared || passkeyDir == stateDir;
+      message = "services.canvas-api.passkeyFile outside ${stateDir} needs sharedAuthGroup.";
+    }];
+    users.groups = { canvas-api = { }; } // lib.optionalAttrs shared { ${cfg.sharedAuthGroup} = { }; };
+    systemd.tmpfiles.rules = lib.optional shared "d ${passkeyDir} 2770 root ${cfg.sharedAuthGroup} - -";
     users.users = {
       canvas-api = {
         isSystemUser = true;
@@ -176,12 +202,16 @@ in
         CANVAS_API_KEY_FILE = "${stateDir}/api-key";
         CANVAS_API_CREDENTIALS_FILE = runtimeCreds;
         CANVAS_API_KEEPALIVE_SECONDS = toString cfg.keepaliveSeconds;
+        CANVAS_API_PASSKEY_FILE = passkeyFile;
+        CANVAS_API_PASSKEY_SHARED = if shared then "1" else "0";
         HOME = stateDir;
         XDG_CACHE_HOME = "${stateDir}/.cache";
       };
       serviceConfig = {
         User = "canvas-api";
         Group = "canvas-api";
+        SupplementaryGroups = lib.optional shared cfg.sharedAuthGroup;
+        ReadWritePaths = lib.optional shared passkeyDir;
         StateDirectory = "canvas-api";
         StateDirectoryMode = "0750";
         RuntimeDirectory = "canvas-api";

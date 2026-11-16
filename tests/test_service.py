@@ -1,3 +1,4 @@
+import dataclasses
 import asyncio
 from pathlib import Path
 
@@ -98,6 +99,9 @@ window.registerKey = () => navigator.credentials.create({publicKey: {
 window.useKey = id => navigator.credentials.get({publicKey: {
   challenge: rnd(32), rpId: "localhost", allowCredentials: [{type: "public-key", id: b64(id)}],
 }}).then(c => c.id);
+window.useKeyCounter = id => navigator.credentials.get({publicKey: {
+  challenge: rnd(32), rpId: "localhost", allowCredentials: [{type: "public-key", id: b64(id)}],
+}}).then(c => new DataView(c.response.authenticatorData).getUint32(33));
 </script>"""
 
 
@@ -173,3 +177,61 @@ def test_unloadable_passkey_is_never_dropped(tmp_path):
     asyncio.run(run())
     kept = json.loads((tmp_path / "passkeys.json").read_text())["credentials"]
     assert {"credentialId": "abc", "privateKey": "secret", "rpId": None, "signCount": 4} in kept
+
+
+def test_shared_key_counter_always_increases(tmp_path):
+    """Two browsers (canvas-api and another service) sharing one key file: every assertion
+    the relying party sees must carry a higher counter than the last, or it looks cloned."""
+    import http.server
+    import json
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(WEBAUTHN_PAGE)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://localhost:{server.server_port}/"
+    shared = tmp_path / "auth" / "passkeys.json"
+
+    def settings_for(name):
+        state = tmp_path / name
+        state.mkdir()
+        return dataclasses.replace(make_settings(state), passkey_file=shared, passkey_shared=True)
+
+    async def run():
+        a, b = CanvasBrowser(settings_for("a")), CanvasBrowser(settings_for("b"))
+        await a.start()
+        await b.start()
+        try:
+            pa, pb = await a.control_page(), await b.control_page()
+            await pa.goto(url)
+            await pb.goto(url)
+            key_id = await pa.evaluate("() => registerKey()")
+            await a.passkeys.save()
+            seen = []
+            # B used it twice while A's browser still holds its old counter in memory, and so on.
+            for browser, page in [(b, pb), (b, pb), (a, pa), (b, pb), (a, pa), (a, pa)]:
+                await browser.passkeys.sync()
+                seen.append(await page.evaluate("id => useKeyCounter(id)", key_id))
+                await browser.passkeys.save()
+            return seen
+        finally:
+            await a.stop()
+            await b.stop()
+
+    try:
+        seen = asyncio.run(run())
+        assert all(later > earlier for earlier, later in zip(seen, seen[1:])), seen
+        stored = json.loads(shared.read_text())["credentials"]
+        assert stored[0]["signCount"] >= seen[-1]
+        assert shared.stat().st_mode & 0o777 == 0o660
+    finally:
+        server.shutdown()

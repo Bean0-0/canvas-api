@@ -45,7 +45,7 @@ class CanvasBrowser:
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._page_lock = asyncio.Lock()
-        self.passkeys = PasskeyStore(settings.state_dir / "passkeys.json")
+        self.passkeys = PasskeyStore(settings.passkey_path, shared=settings.passkey_shared)
         self._network: deque[dict] = deque(maxlen=1000)
 
     @property

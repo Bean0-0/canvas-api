@@ -116,6 +116,7 @@ class LoginManager:
             if await self.browser.current_user():
                 await self._update(state="logged_in", message="Already logged in", finished_at=time.time())
                 return
+            await self.browser.passkeys.sync()  # another service may have used the shared key
             await self._drive(page)
             await self._update(state="logged_in", message="Logged in", mfa_number=None,
                                finished_at=time.time(), url=page.url)

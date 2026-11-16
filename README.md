@@ -65,6 +65,21 @@ live file is ever emptied or damaged, the key comes back on its own.
 To retire a key for good, delete it on the Microsoft or Duo page first. Then remove it from
 both files with `sudo` while the service is stopped.
 
+### Sharing the key with another service
+
+Another service on the same machine (such as encando-api) can use the same security key.
+Set `passkeyFile = "/var/lib/tamu-auth/passkeys.json"` and `sharedAuthGroup = "tamu-auth"`,
+and add the other service to that group. The directory becomes `root:tamu-auth 2770`, the
+file `0660`, and both services hold `passkeys.json.lock` while they read or write it. The
+backup follows the file. On first start it also reads the old `/var/lib/canvas-api/passkeys.json`,
+so the key carries over.
+
+Two copies of one key are only safe if the relying party (Duo) always sees a higher
+signature counter than before; otherwise the key looks cloned. Before each use, every
+service raises the counter to the largest of the file's value, its browser's value, and the
+seconds since 2024-01-01. The clock only moves forward, so neither copy can fall behind. A
+service that shares the file must do the same (`COUNTER_EPOCH` in `passkeys.py`).
+
 ### Login status
 
 ```sh
@@ -224,7 +239,8 @@ CANVAS_API_STATE_DIR=./state python -m canvas_api   # serves on 127.0.0.1:8787
 
 Settings come from environment variables (see `canvas_api/config.py`): `CANVAS_BASE_URL`,
 `CANVAS_API_STATE_DIR`, `CANVAS_API_KEY_FILE`, `CANVAS_API_CREDENTIALS_FILE`,
-`CANVAS_API_HOST`, `CANVAS_API_PORT`, `CANVAS_API_KEEPALIVE_SECONDS`, and
+`CANVAS_API_HOST`, `CANVAS_API_PORT`, `CANVAS_API_KEEPALIVE_SECONDS`, `CANVAS_API_PASSKEY_FILE`,
+`CANVAS_API_PASSKEY_SHARED`, and
 `CANVAS_API_LOGIN_TIMEOUT_SECONDS`.
 
 ## NixOS
