@@ -88,6 +88,16 @@ window.register = () => navigator.credentials.create({publicKey: {
 window.signin = () => navigator.credentials.get({publicKey: {
   challenge: rnd(32), rpId: "localhost", userVerification: "required",
 }}).then(c => c.id);
+const b64 = s => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+window.registerKey = () => navigator.credentials.create({publicKey: {
+  challenge: rnd(32), rp: {name: "test", id: "localhost"},
+  user: {id: rnd(16), name: "box", displayName: "box"},
+  pubKeyCredParams: [{type: "public-key", alg: -7}],
+  authenticatorSelection: {residentKey: "discouraged"},
+}}).then(c => c.id);
+window.useKey = id => navigator.credentials.get({publicKey: {
+  challenge: rnd(32), rpId: "localhost", allowCredentials: [{type: "public-key", id: b64(id)}],
+}}).then(c => c.id);
 </script>"""
 
 
@@ -111,13 +121,13 @@ def test_passkey_survives_restart(tmp_path):
     url = f"http://localhost:{server.server_port}/"
     settings = make_settings(tmp_path)
 
-    async def session(action):
+    async def session(action, arg=None):
         browser = CanvasBrowser(settings)
         await browser.start()
         try:
             page = await browser.control_page()
             await page.goto(url)
-            result = await page.evaluate(f"{action}()")
+            result = await page.evaluate(f"a => {action}(a)", arg)
             await browser.passkeys.save()
             return result, await browser.passkeys.summary()
         finally:
@@ -130,5 +140,14 @@ def test_passkey_survives_restart(tmp_path):
         used, stored = asyncio.run(session("signin"))
         assert used == created
         assert stored[0]["signCount"] >= 1
+
+        # Non-discoverable keys (what Duo registers): Chrome stops reporting their rpId
+        # after a reload, so it must survive several restarts from our own records.
+        (tmp_path / "passkeys.json").unlink()
+        key_id, _ = asyncio.run(session("registerKey"))
+        for _ in range(3):
+            used, stored = asyncio.run(session("useKey", key_id))
+            assert used == key_id
+            assert [p["rpId"] for p in stored] == ["localhost"]
     finally:
         server.shutdown()

@@ -143,6 +143,7 @@ class LoginManager:
         duo_passkey = any("duo" in rp for rp in rp_ids)
         passkey_attempts = 0
         duo_key_attempts = 0
+        duo_seen_at: float | None = None
         await self._step("Opening Canvas login")
         await page.goto(self.settings.base_url + "/login", wait_until="domcontentloaded")
         deadline = time.monotonic() + self.settings.login_timeout_seconds
@@ -244,6 +245,7 @@ class LoginManager:
 
             # --- Duo Universal Prompt (if the tenant federates MFA to Duo) ---------
             if "duosecurity.com" in host or "duo.com" in host:
+                duo_seen_at = duo_seen_at or time.monotonic()
                 if await _visible(page, DUO_TRUST_BROWSER):
                     await self._step("Telling Duo this is a trusted device")
                     await page.locator(DUO_TRUST_BROWSER).first.click()
@@ -255,12 +257,16 @@ class LoginManager:
                         await page.locator(DUO_SECURITY_KEY).first.click()
                         await asyncio.sleep(3)
                         continue
-                    if await _visible(page, DUO_OTHER_OPTIONS) and "duo-other" not in done_actions:
+                    # Duo auto-starts the last-used method; give its security-key prompt a chance first.
+                    waited = time.monotonic() - duo_seen_at
+                    if waited > 10 and await _visible(page, DUO_OTHER_OPTIONS) and "duo-other" not in done_actions:
                         done_actions.add("duo-other")
                         await self._step("Opening Duo's other options")
                         await page.locator(DUO_OTHER_OPTIONS).first.click()
                         continue
-                    continue  # Duo may already be asking the key; give it time
+                    if self.status.state != "running" or "Waiting for Duo" not in self.status.message:
+                        await self._update(state="running", message="Waiting for Duo to accept the security key")
+                    continue
                 if self.status.automatic:
                     raise MfaRequired("Duo approval required; start a login with POST /session/login")
                 number = await _duo_verified_push_code(page)

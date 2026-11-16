@@ -54,9 +54,12 @@ class PasskeyStore:
         self._authenticator_id = result["authenticatorId"]
         self._saved = self.load()
         for credential in self._saved:
+            if not credential.get("rpId"):
+                log.error("skipping passkey %s: no rpId recorded", credential.get("credentialId"))
+                continue
             await self._session.send("WebAuthn.addCredential", {
                 "authenticatorId": self._authenticator_id,
-                "credential": {k: credential[k] for k in CREDENTIAL_FIELDS if k in credential},
+                "credential": {k: credential[k] for k in CREDENTIAL_FIELDS if credential.get(k) is not None},
             })
         log.info("virtual security key ready with %d passkey(s)", len(self._saved))
 
@@ -64,7 +67,15 @@ class PasskeyStore:
         if self._session is None or self._authenticator_id is None:
             return self._saved
         result = await self._session.send("WebAuthn.getCredentials", {"authenticatorId": self._authenticator_id})
-        return [{k: c[k] for k in CREDENTIAL_FIELDS if k in c} for c in result["credentials"]]
+        # Chrome omits rpId for non-discoverable credentials it was given; keep the one we know.
+        known = {c.get("credentialId"): c.get("rpId") for c in self._saved}
+        current = []
+        for c in result["credentials"]:
+            entry = {k: c[k] for k in CREDENTIAL_FIELDS if c.get(k) is not None}
+            if not entry.get("rpId") and known.get(entry.get("credentialId")):
+                entry["rpId"] = known[entry["credentialId"]]
+            current.append(entry)
+        return current
 
     async def save(self) -> int:
         """Persist new credentials and sign counters. Returns the number of stored passkeys."""
