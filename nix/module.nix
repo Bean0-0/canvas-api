@@ -3,6 +3,40 @@ let
   cfg = config.services.canvas-api;
   stateDir = "/var/lib/canvas-api";
   runtimeCreds = "/run/canvas-api/credentials.env";
+  passkeyFile = "${stateDir}/passkeys.json";
+  backupDir = "/var/backups/canvas-api";
+  passkeyBackup = "${backupDir}/passkeys.json";
+
+  # Root-owned, add-only union of every passkey the service has saved. A key's private
+  # half cannot be recovered once lost, so nothing here ever removes a credential:
+  # per credentialId the highest signCount wins and a known rpId is never forgotten.
+  backupPasskeys = pkgs.writeShellApplication {
+    name = "canvas-api-backup-passkeys";
+    runtimeInputs = [ pkgs.coreutils pkgs.jq ];
+    text = ''
+      install -d -o root -g root -m 0700 ${backupDir}
+      sources=()
+      for f in ${passkeyBackup} ${passkeyFile}; do
+        if [[ -s "$f" ]] && jq -e '.credentials | type == "array"' "$f" >/dev/null 2>&1; then
+          sources+=("$f")
+        else
+          [[ ! -e "$f" ]] || echo "ignoring unreadable passkey file $f" >&2
+        fi
+      done
+      (( ''${#sources[@]} )) || exit 0
+      tmp=$(mktemp ${backupDir}/.passkeys.XXXXXX)
+      trap 'rm -f -- "$tmp"' EXIT
+      jq -s '{credentials: ([.[].credentials[] | select(.credentialId and .privateKey)]
+              | group_by(.credentialId)
+              | map(max_by(.signCount // 0) + {rpId: ([.[].rpId | select(. != null)] | first)}))}' \
+        "''${sources[@]}" > "$tmp"
+      if [[ "$(jq '.credentials | length' "$tmp")" -gt 0 ]] && ! cmp -s "$tmp" ${passkeyBackup}; then
+        chmod 0600 "$tmp"
+        mv "$tmp" ${passkeyBackup}
+        echo "passkey backup updated: $(jq '.credentials | length' ${passkeyBackup}) key(s)"
+      fi
+    '';
+  };
 
   # Root half of startup: create an API key once, hand credentials to the service user.
   prepare = pkgs.writeShellApplication {
@@ -16,6 +50,12 @@ let
       fi
       chmod 0640 ${stateDir}/api-key
       rm -f ${runtimeCreds}
+      # Back up, then restore any key missing from (or older in) the service's own file.
+      ${backupPasskeys}/bin/canvas-api-backup-passkeys
+      if [[ -s ${passkeyBackup} ]] && ! cmp -s ${passkeyBackup} ${passkeyFile}; then
+        install -o canvas-api -g canvas-api -m 0600 ${passkeyBackup} ${passkeyFile}
+        echo "restored passkeys from ${passkeyBackup}"
+      fi
       if [[ -f ${lib.escapeShellArg cfg.credentialsFile} ]]; then
         install -o canvas-api -g canvas-api -m 0400 ${lib.escapeShellArg cfg.credentialsFile} ${runtimeCreds}
       fi
@@ -106,6 +146,21 @@ in
       (_: { allowedTCPPorts = [ cfg.port ]; });
 
     environment.systemPackages = [ setCredentials showKey ];
+
+    # Back up the passkey file whenever the service rewrites it (and hourly as a fallback).
+    systemd.paths.canvas-api-passkey-backup = {
+      wantedBy = [ "multi-user.target" ];
+      pathConfig.PathChanged = passkeyFile;
+    };
+    systemd.services.canvas-api-passkey-backup = {
+      description = "Back up canvas-api passkeys (add-only)";
+      startAt = "hourly";
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${backupPasskeys}/bin/canvas-api-backup-passkeys";
+        UMask = "0077";
+      };
+    };
 
     systemd.services.canvas-api = {
       description = "Canvas API (headless browser session for ${cfg.baseUrl})";

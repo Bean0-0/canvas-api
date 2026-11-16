@@ -56,6 +56,15 @@ that key on your account once, and logins need no stored password and no phone:
 
 To revoke the box's access, delete that security key on the Microsoft or Duo page.
 
+The keys are backed up automatically. Every time the service rewrites `passkeys.json`,
+root merges it into `/var/backups/canvas-api/passkeys.json`. The backup is root-only and
+add-only: it never removes a key, and it keeps each key's highest sign counter and known
+`rpId`. On every service start, root merges that backup back into the live file. If the
+live file is ever emptied or damaged, the key comes back on its own.
+
+To retire a key for good, delete it on the Microsoft or Duo page first. Then remove it from
+both files with `sudo` while the service is stopped.
+
 ### Login status
 
 ```sh
