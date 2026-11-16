@@ -29,20 +29,37 @@ service generate a new key on restart.
 
 ## Logging in
 
-Your NetID credentials live in the root-only `/etc/canvas-api/credentials.env`.
-They never go into Git or the Nix store. Set them once:
+The browser has a built-in **virtual security key**. Any passkey it registers is saved to
+`/var/lib/canvas-api/passkeys.json` (mode 0600) and loaded again on every start. Register
+that key on your account once, and logins need no stored password and no phone:
 
-```sh
-ssh -t <vps> sudo canvas-api-credentials
-```
+- **Microsoft passkey**: sign-in uses "Sign-in options → Face, fingerprint, PIN or security
+  key", which needs no username and no password.
+- **Duo security key**: when Duo prompts, the service picks "Security key" and the virtual
+  key answers. Microsoft still asks for a password first.
 
-Then start a login and approve it on your phone:
+### One-time setup
+
+1. Sign in once, passing your login in the request so it is used for that attempt only
+   and never stored. Approve the Duo prompt on your phone.
+
+   ```sh
+   curl -X POST -H "Authorization: Bearer $CANVAS_API_KEY" -H 'content-type: application/json' \
+        -d '{"username":"netid@tamu.edu","password":"..."}' $CANVAS_API/session/login
+   curl -H "Authorization: Bearer $CANVAS_API_KEY" "$CANVAS_API/session/login?wait_seconds=90"
+   ```
+2. With `/browser/goto` and `/browser/screenshot`, open Microsoft's
+   [Security info](https://mysignins.microsoft.com/security-info) page or Duo's device
+   management portal. Add a security key or passkey there. The registration prompt goes to
+   the virtual key, which answers it automatically.
+3. Check that it was kept: `GET /passkey` lists the saved keys by `rpId`.
+
+To revoke the box's access, delete that security key on the Microsoft or Duo page.
+
+### Login status
 
 ```sh
 curl -X POST -H "Authorization: Bearer $CANVAS_API_KEY" $CANVAS_API/session/login
-# {"state":"awaiting_mfa","mfa_number":"42","message":"Approve the sign-in in Microsoft Authenticator and enter 42", ...}
-curl -H "Authorization: Bearer $CANVAS_API_KEY" "$CANVAS_API/session/login?wait_seconds=60"
-# {"state":"logged_in", ...}
 ```
 
 | `state` | Meaning |
@@ -56,15 +73,18 @@ curl -H "Authorization: Bearer $CANVAS_API_KEY" "$CANVAS_API/session/login?wait_
 
 The login answers "Stay signed in?" with yes, and the browser profile persists in
 `/var/lib/canvas-api/profile`. Every 10 minutes the service checks the Canvas session.
-When the session expires, the service tries to log in again in the background, and
-Microsoft usually skips MFA for a remembered browser. If MFA is required, the
-background attempt stops and waits for you. It won't try again for 6 hours, so you
-won't get random phone prompts. Run `POST /session/login` yourself when that happens.
+When it has expired, the service logs in again in the background with the passkey. If no
+passkey is saved, it uses stored credentials instead. If a background attempt hits a phone
+prompt, it stops and waits 6 hours before trying again.
 
-For fully unattended logins, add an "Authenticator app" sign-in method on your account
-in Microsoft's [Security info](https://mysignins.microsoft.com/security-info) page. Choose
-"different authenticator app" to see the secret key, and paste it as the TOTP secret
-in `canvas-api-credentials`. The service then types the 6-digit codes itself.
+### Stored credentials (optional)
+
+You only need these if you use the Duo security-key path, which still needs a password,
+or if you don't use a passkey. They go in the root-only `/etc/canvas-api/credentials.env`:
+
+```sh
+ssh -t <vps> sudo canvas-api-credentials
+```
 
 ## Canvas API
 

@@ -15,7 +15,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeout
 from pydantic import BaseModel, Field
 
 from .browser import CanvasBrowser, strip_hijack_prefix
-from .config import Settings
+from .config import Credentials, Settings
 from .login import LoginManager
 
 log = logging.getLogger(__name__)
@@ -27,6 +27,8 @@ LINK_RE = re.compile(r'<([^>]+)>;\s*rel="([^"]+)"')
 
 class LoginRequest(BaseModel):
     wait_seconds: float = Field(30, ge=0, le=120, description="Wait for completion or an MFA prompt")
+    username: str | None = Field(None, description="One-time NetID/email; used for this login only, never stored")
+    password: str | None = Field(None, description="One-time password; used for this login only, never stored")
 
 
 class CodeRequest(BaseModel):
@@ -94,7 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         while True:
             try:
                 if not login.running and await browser.current_user() is None:
-                    if settings.load_credentials():
+                    if settings.load_credentials() or await browser.passkeys.has_any():
                         log.info("session missing; starting automatic login")
                         login.start(automatic=True)
             except Exception:
@@ -156,7 +158,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def start_login(body: LoginRequest | None = None):
         """Start SSO login. Returns early with `awaiting_mfa` + `mfa_number` when your phone must approve."""
         body = body or LoginRequest()
-        login.start(automatic=False)
+        one_time = None
+        if body.username and body.password:
+            one_time = Credentials(username=body.username, password=body.password)
+        login.start(automatic=False, credentials=one_time)
         status = await login.wait_for_progress(body.wait_seconds)
         return status.to_dict()
 
@@ -171,6 +176,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """Provide a one-time verification code when the login state is `awaiting_code`."""
         await login.submit_code(body.code)
         return (await login.wait_for_progress(15)).to_dict()
+
+    @app.get("/passkey", tags=["session"], dependencies=auth)
+    async def passkey_status():
+        """Passkeys held by the browser's virtual security key (no private material)."""
+        return {"passkeys": await browser.passkeys.summary()}
+
+    @app.post("/passkey/save", tags=["session"], dependencies=auth)
+    async def passkey_save():
+        """Write newly registered passkeys to disk (also happens automatically)."""
+        return {"saved": await browser.passkeys.save()}
 
     @app.post("/session/logout", tags=["session"], dependencies=auth)
     async def logout():
@@ -197,7 +212,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         result = await browser.fetch(request.method, f"/api/{path}", params=params, body=body, headers=headers)
 
         if session_expired(result.status, result.body):
-            if settings.load_credentials():
+            if settings.load_credentials() or await browser.passkeys.has_any():
                 login.start(automatic=True)
             return JSONResponse(
                 {"error": "canvas_session_expired",
@@ -247,6 +262,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     async def page_state() -> dict:
         page = await browser.control_page()
+        await browser.passkeys.save()  # a browser action may have registered a passkey
         return {"url": page.url, "title": await page.title()}
 
     @app.get("/browser", tags=["browser"], dependencies=auth)

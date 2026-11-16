@@ -12,7 +12,7 @@ import pyotp
 from playwright.async_api import Page
 
 from .browser import CanvasBrowser
-from .config import Settings
+from .config import Credentials, Settings
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +35,11 @@ class LoginStatus:
         return asdict(self)
 
 
+MS_PASSKEY_TILE = '[role=button]:has-text("Face, fingerprint, PIN or security key")'
+DUO_SECURITY_KEY = 'button:has-text("Security key"), a:has-text("Security key"), [role=button]:has-text("Security key")'
+DUO_OTHER_OPTIONS = 'button:has-text("Other options"), a:has-text("Other options")'
+
+
 class MfaRequired(Exception):
     pass
 
@@ -48,6 +53,7 @@ class LoginManager:
         self._code: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
         self._changed = asyncio.Condition()
         self._last_auto_mfa_stop = 0.0
+        self._one_time_creds: Credentials | None = None
 
     @property
     def running(self) -> bool:
@@ -64,7 +70,10 @@ class LoginManager:
         self.status.steps.append(text)
         await self._update(state="running", message=text, mfa_number=None)
 
-    def start(self, automatic: bool = False) -> LoginStatus:
+    def start(self, automatic: bool = False, credentials: Credentials | None = None) -> LoginStatus:
+        """Begin a login. `credentials` are used for this attempt only and never written to disk."""
+        if credentials is not None:
+            self._one_time_creds = credentials
         if self.running:
             if not automatic:
                 # A person is now waiting: let the in-flight login continue into MFA.
@@ -115,10 +124,21 @@ class LoginManager:
             log.exception("login crashed")
             await self._update(state="needs_attention", message=f"Login error: {exc}",
                                finished_at=time.time(), url=page.url)
+        finally:
+            self._one_time_creds = None
+            try:
+                await self.browser.passkeys.save()  # persist sign counters / new keys
+            except Exception:
+                log.exception("could not save passkeys")
 
     async def _drive(self, page: Page) -> None:
-        creds = self.settings.load_credentials()
+        creds = self._one_time_creds or self.settings.load_credentials()
         base_host = self.settings.base_host
+        rp_ids = {c.get("rpId", "") for c in await self.browser.passkeys.credentials()}
+        ms_passkey = any("microsoft" in rp for rp in rp_ids)
+        duo_passkey = any("duo" in rp for rp in rp_ids)
+        passkey_attempts = 0
+        duo_key_attempts = 0
         await self._step("Opening Canvas login")
         await page.goto(self.settings.base_url + "/login", wait_until="domcontentloaded")
         deadline = time.monotonic() + self.settings.login_timeout_seconds
@@ -184,6 +204,18 @@ class LoginManager:
                 await page.wait_for_load_state("domcontentloaded")
                 continue
 
+            if ms_passkey and passkey_attempts < 2:
+                if await _visible(page, MS_PASSKEY_TILE):
+                    passkey_attempts += 1
+                    await self._step("Signing in with the box's passkey")
+                    await page.locator(MS_PASSKEY_TILE).first.click()
+                    await asyncio.sleep(3)
+                    continue
+                if await _visible(page, "[data-test-id=signinOptions]") and await _usable(page, "input[name=loginfmt]"):
+                    await self._step("Opening Microsoft sign-in options")
+                    await page.locator("[data-test-id=signinOptions]").first.click()
+                    continue
+
             if await _usable(page, "input[name=loginfmt]"):
                 if creds is None:
                     raise LoginError("needs_attention", "Microsoft asked for a username but no credentials are configured")
@@ -206,6 +238,19 @@ class LoginManager:
                     await self._step("Trusting this browser in Duo")
                     await page.click("#trust-browser-button")
                     continue
+                if duo_passkey and duo_key_attempts < 3:
+                    if await _visible(page, DUO_SECURITY_KEY):
+                        duo_key_attempts += 1
+                        await self._step("Using the box's security key in Duo")
+                        await page.locator(DUO_SECURITY_KEY).first.click()
+                        await asyncio.sleep(3)
+                        continue
+                    if await _visible(page, DUO_OTHER_OPTIONS) and "duo-other" not in done_actions:
+                        done_actions.add("duo-other")
+                        await self._step("Opening Duo's other options")
+                        await page.locator(DUO_OTHER_OPTIONS).first.click()
+                        continue
+                    continue  # Duo may already be asking the key; give it time
                 if self.status.automatic:
                     raise MfaRequired("Duo approval required; start a login with POST /session/login")
                 code_box = page.locator(".verification-code")

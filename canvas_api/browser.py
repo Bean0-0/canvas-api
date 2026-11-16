@@ -11,6 +11,7 @@ from urllib.parse import unquote, urlencode
 from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
 
 from .config import Settings
+from .passkeys import PasskeyStore
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ class CanvasBrowser:
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._page_lock = asyncio.Lock()
+        self.passkeys = PasskeyStore(settings.state_dir / "passkeys.json")
 
     @property
     def context(self) -> BrowserContext:
@@ -72,6 +74,10 @@ class CanvasBrowser:
 
     async def stop(self) -> None:
         if self._context is not None:
+            try:
+                await self.passkeys.save()
+            except Exception:
+                log.exception("could not save passkeys on shutdown")
             await self._context.close()
         if self._pw is not None:
             await self._pw.stop()
@@ -84,6 +90,7 @@ class CanvasBrowser:
                 self._page = pages[0] if pages else await self.context.new_page()
                 for extra in pages[1:]:
                     await extra.close()
+                await self.passkeys.attach(self.context, self._page)
             return self._page
 
     async def csrf_token(self) -> str | None:

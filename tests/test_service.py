@@ -75,3 +75,60 @@ def test_browser_launches(tmp_path):
             await browser.stop()
 
     asyncio.run(run())
+
+
+WEBAUTHN_PAGE = b"""<!doctype html><title>webauthn</title><script>
+const rnd = n => crypto.getRandomValues(new Uint8Array(n));
+window.register = () => navigator.credentials.create({publicKey: {
+  challenge: rnd(32), rp: {name: "test", id: "localhost"},
+  user: {id: rnd(16), name: "box", displayName: "box"},
+  pubKeyCredParams: [{type: "public-key", alg: -7}],
+  authenticatorSelection: {residentKey: "required", userVerification: "required"},
+}}).then(c => c.id);
+window.signin = () => navigator.credentials.get({publicKey: {
+  challenge: rnd(32), rpId: "localhost", userVerification: "required",
+}}).then(c => c.id);
+</script>"""
+
+
+def test_passkey_survives_restart(tmp_path):
+    """A passkey registered by a site is saved and usable after the browser restarts."""
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(WEBAUTHN_PAGE)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://localhost:{server.server_port}/"
+    settings = make_settings(tmp_path)
+
+    async def session(action):
+        browser = CanvasBrowser(settings)
+        await browser.start()
+        try:
+            page = await browser.control_page()
+            await page.goto(url)
+            result = await page.evaluate(f"{action}()")
+            await browser.passkeys.save()
+            return result, await browser.passkeys.summary()
+        finally:
+            await browser.stop()
+
+    try:
+        created, stored = asyncio.run(session("register"))
+        assert [p["rpId"] for p in stored] == ["localhost"]
+        assert (tmp_path / "passkeys.json").stat().st_mode & 0o777 == 0o600
+        used, stored = asyncio.run(session("signin"))
+        assert used == created
+        assert stored[0]["signCount"] >= 1
+    finally:
+        server.shutdown()
