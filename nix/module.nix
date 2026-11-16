@@ -55,6 +55,7 @@ let
       fi
       chmod 0640 ${stateDir}/api-key
       rm -f ${runtimeCreds}
+      ${lib.optionalString shared "install -d -o root -g ${cfg.sharedAuthGroup} -m 2770 ${passkeyDir}"}
       # Back up, then restore any key missing from (or older in) the service's own file.
       ${backupPasskeys}/bin/canvas-api-backup-passkeys
       if [[ -s ${passkeyBackup} ]] && ! cmp -s ${passkeyBackup} ${passkeyFile}; then
