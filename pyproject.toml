@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "canvas-api"
+version = "0.1.0"
+description = "HTTP API for Canvas LMS backed by a logged-in headless browser session"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "uvicorn",
+  "playwright",
+  "pyotp",
+]
+
+[project.scripts]
+canvas-api = "canvas_api.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["canvas_api*"]
